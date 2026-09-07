@@ -1,0 +1,75 @@
+{
+  "experiment_name": "chunk_700",
+  "description": "청크 700/100에서 similarity/mmr/bm25/hybrid 4개 검색 전략 비교 (기준 노트북 baseline)",
+  "data": {
+    "document_dir": "../data/public",
+    "document_glob": "*.pdf",
+    "golden_set_path": "../data/public/public_paragraph_golden_set.json"
+  },
+  "chunking": {
+    "chunk_size": 700,
+    "chunk_overlap": 100,
+    "separators": null
+  },
+  "embedding": {
+    "provider": "google",
+    "model": "gemini-embedding-001"
+  },
+  "index": {
+    "persist_dir": "./.index_cache",
+    "rebuild": false
+  },
+  "retrieval": {
+    "top_k": 5,
+    "methods": [
+      {
+        "name": "similarity"
+      },
+      {
+        "name": "mmr",
+        "fetch_k": 20,
+        "lambda_mult": 0.5
+      },
+      {
+        "name": "bm25",
+        "tokenizer": "kiwi"
+      },
+      {
+        "name": "hybrid",
+        "weights": [
+          0.5,
+          0.5
+        ]
+      }
+    ]
+  },
+  "generation": {
+    "enabled": true,
+    "model": "gemini-3.6-flash",
+    "temperature": 0.0,
+    "max_concurrency": 4
+  },
+  "evaluation": {
+    "retrieval": {
+      "enabled": true,
+      "k_list": [
+        1,
+        3,
+        5
+      ]
+    },
+    "ragas": {
+      "enabled": true,
+      "metrics": [
+        "faithfulness",
+        "answer_relevancy"
+      ],
+      "methods": [
+        "similarity",
+        "hybrid"
+      ],
+      "sample_size": null,
+      "max_concurrency": 4
+    }
+  }
+}

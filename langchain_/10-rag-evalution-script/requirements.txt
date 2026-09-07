@@ -1,0 +1,28 @@
+# RAG 실험 스크립트 의존성
+# 실행 인터프리터: 시스템 Python 3.13 (C:\Users\snail\AppData\Local\Programs\Python\Python313)
+python-dotenv
+
+# LangChain (v1 계열)
+langchain-core
+langchain-classic
+langchain-community
+langchain-text-splitters
+
+# 벡터 저장소
+langchain-chroma
+chromadb
+
+# 임베딩 / LLM (Gemini)
+langchain-google-genai
+google-genai
+
+# 문서 로더
+pypdf
+
+# 키워드 검색
+rank-bm25
+kiwipiepy
+
+# 생성 평가
+ragas
+instructor

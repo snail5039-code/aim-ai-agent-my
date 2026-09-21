@@ -1,0 +1,871 @@
+<h1>26.09.21 45일차(Python [Fault Tolerance, Agent Tool Control, LangGraph Logging])</h1><div class="toc" style="border:1px solid #d8dee8;padding:20px 24px;margin:24px 0;background:#f8fafc;"><strong>목차</strong><hr style="margin:14px 0;"><ol><li><a href="#section-1">[TIL] 장애 복구, Agent Tool 통제, LangGraph 실행 기록</a></li><li><a href="#section-2">1. Fault Tolerance란?</a></li><li><a href="#section-3">2. RetryPolicy로 자동 재시도하기</a></li><li><a href="#section-4">3. 재시도되는 오류와 재시도되지 않는 결과</a></li><li><a href="#section-5">4. RetryPolicy, with_retry, with_fallbacks 차이</a></li><li><a href="#section-6">5. Checkpointer를 이용한 노드 재개</a></li><li><a href="#section-7">6. Super-step과 병렬 노드 재개</a></li><li><a href="#section-8">7. 노드 실행 시간 제한</a></li><li><a href="#section-9">8. 재시도 소진 후 Error Handler</a></li><li><a href="#section-10">9. 공통 노드 정책 설정</a></li><li><a href="#section-11">10. 멱등성과 중복 저장 방지</a></li><li><a href="#section-12">11. Agent Tool 통제가 필요한 이유</a></li><li><a href="#section-13">12. Tool 입력 Schema</a></li><li><a href="#section-14">13. Tool 이름과 Schema 매핑</a></li><li><a href="#section-15">14. model_validate로 인자 검사</a></li><li><a href="#section-16">15. 권한, 송금 한도, 승인 검사</a></li><li><a href="#section-17">16. 실행 Context</a></li><li><a href="#section-18">17. 실행 전 Middleware</a></li><li><a href="#section-19">18. 실행 후 결과 검증 Middleware</a></li><li><a href="#section-20">19. create_agent와 Middleware 등록</a></li><li><a href="#section-21">20. Tool 호출 횟수 제한</a></li><li><a href="#section-22">21. Tool이 많아질 때 검사 함수 분리</a></li><li><a href="#section-23">22. Context로 Tool 실행 허용하기 실습</a></li><li><a href="#section-24">23. print 대신 logging을 사용하는 이유</a></li><li><a href="#section-25">24. Logger, Handler, Formatter</a></li><li><a href="#section-26">25. 로그 레벨</a></li><li><a href="#section-27">26. 변수와 함께 로그 남기기</a></li><li><a href="#section-28">27. 화면과 파일에 서로 다른 레벨 기록</a></li><li><a href="#section-29">28. 로그 파일 로테이션</a></li><li><a href="#section-30">29. logger.error와 logger.exception 차이</a></li><li><a href="#section-31">30. LangGraph Node에 로그 적용하기</a></li><li><a href="#section-32">31. 세 파일의 전체 연결</a></li><li><a href="#section-33">32. 외워야 할 코드</a></li><li><a href="#section-34">33. 이번 학습에서 기억할 점</a></li><li><a href="#section-35">34. 헷갈린 점</a></li><li><a href="#section-36">추가!</a></li></ol></div>
+<h2 id="section-1">[TIL] 장애 복구, Agent Tool 통제, LangGraph 실행 기록</h2>
+<p>오늘은 LangGraph에서 실패한 작업을 다시 시도하고 이어서 실행하는 <strong>Fault Tolerance</strong>, Agent가 Tool을 호출하기 전후를 검사하는 <strong>Tool Control Middleware</strong>, 실행 과정과 오류를 기록하는 <strong>Logging</strong>을 학습했다.</p>
+<p>세 주제는 서로 달라 보이지만 실제 서비스에서 다음 순서로 연결된다.</p>
+<pre><code class="language-text">요청 실행
+→ 일시적 오류는 재시도
+→ 계속 실패하면 실패 상태로 전환
+→ Tool 호출 전 권한·인자 검사
+→ Tool 호출 후 결과 검사
+→ 전체 실행 과정과 오류를 로그로 기록
+</code></pre>
+<pre><code class="language-text">Fault Tolerance
+실패 → RetryPolicy로 재시도 → Checkpoint에서 재개 → 최종 실패 처리
+
+Tool Control
+LLM의 Tool 호출 제안 → 실행 전 Middleware → 실제 Tool → 실행 후 Middleware
+
+Logging
+Node 시작 → 변수와 결과 기록 → 오류 발생 시 traceback 기록
+</code></pre>
+<p>아래 내용은 <code>27-fault-tolerance.ipynb</code>, <code>28-agent-tool-control.ipynb</code>, <code>29-langgraph-logging.ipynb</code>를 바탕으로 정리했다.</p>
+<hr>
+<h2 id="section-2">1. Fault Tolerance란?</h2>
+<p>Fault Tolerance는 실행 중 일부 작업이 실패해도 전체 서비스를 바로 포기하지 않고 재시도하거나 저장된 지점부터 이어서 처리하는 방식이다.</p>
+<ul>
+<li>일시적인 네트워크 오류는 자동 재시도한다.</li>
+<li>완료된 노드는 다시 실행하지 않고 실패한 노드부터 재개한다.</li>
+<li>최대 재시도 횟수를 소진하면 오류 처리 함수로 이동한다.</li>
+<li>외부 저장 작업은 중복 실행되지 않도록 멱등성을 적용한다.</li>
+</ul>
+<pre><code class="language-text">START
+→ prepare
+→ call_service
+   ├─ 성공 → END
+   └─ ConnectionError → 같은 노드 재시도
+</code></pre>
+<hr>
+<h2 id="section-3">2. RetryPolicy로 자동 재시도하기</h2>
+<pre><code class="language-python">retry_policy = RetryPolicy(
+    initial_interval=1.0,
+    backoff_factor=1.0,
+    max_interval=1.0,
+    max_attempts=3,
+    jitter=True,
+    retry_on=ConnectionError,
+)
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>설정</th>
+<th>의미</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>initial_interval=1.0</code></td>
+<td>첫 재시도 전 1초 대기</td>
+</tr>
+<tr>
+<td><code>backoff_factor=1.0</code></td>
+<td>대기 시간을 늘리지 않고 같은 간격 유지</td>
+</tr>
+<tr>
+<td><code>max_interval=1.0</code></td>
+<td>최대 대기 시간은 1초</td>
+</tr>
+<tr>
+<td><code>max_attempts=3</code></td>
+<td>최초 실행을 포함해 최대 3번 시도</td>
+</tr>
+<tr>
+<td><code>jitter=True</code></td>
+<td>여러 요청이 동시에 재시도하지 않도록 대기 시간에 작은 변동 추가</td>
+</tr>
+<tr>
+<td><code>retry_on=ConnectionError</code></td>
+<td><code>ConnectionError</code>일 때만 재시도</td>
+</tr>
+</tbody></table>
+<p>정책은 재시도할 노드에 연결한다.</p>
+<pre><code class="language-python">builder.add_node(
+    &quot;call_service&quot;,
+    call_unstable_service,
+    retry_policy=retry_policy,
+)
+</code></pre>
+<p><code>prepare</code>는 한 번 실행되고 <code>call_service</code>만 세 번 실행된다.</p>
+<pre><code class="language-text">prepare 실행 1회
+call_service 시도 1 → 실패
+call_service 시도 2 → 실패
+call_service 시도 3 → 성공
+</code></pre>
+<hr>
+<h2 id="section-4">3. 재시도되는 오류와 재시도되지 않는 결과</h2>
+<pre><code class="language-python">retry_on=ConnectionError
+</code></pre>
+<p>이 설정이면 <code>ConnectionError</code>는 재시도하지만 <code>ValueError</code> 같은 다른 예외는 바로 밖으로 전달된다.</p>
+<p>또한 다음 코드는 예외가 아니라 정상적인 반환이다.</p>
+<pre><code class="language-python">return {&quot;status&quot;: &quot;failed&quot;}
+</code></pre>
+<p>따라서 <code>RetryPolicy</code>는 실행되지 않는다. 재시도를 원하면 <code>raise ConnectionError(...)</code>처럼 정책에 등록한 예외를 발생시켜야 한다.</p>
+<hr>
+<h2 id="section-5">4. RetryPolicy, with_retry, with_fallbacks 차이</h2>
+<table>
+<thead>
+<tr>
+<th>방식</th>
+<th>적용 범위</th>
+<th>역할</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>RetryPolicy</code></td>
+<td>LangGraph Node</td>
+<td>실패한 노드 자체를 재실행</td>
+</tr>
+<tr>
+<td><code>with_retry()</code></td>
+<td>Runnable 또는 Chain</td>
+<td>모델·체인 실행을 다시 시도</td>
+</tr>
+<tr>
+<td><code>with_fallbacks()</code></td>
+<td>Runnable 또는 Chain</td>
+<td>실패하면 다른 모델이나 체인 실행</td>
+</tr>
+</tbody></table>
+<p>LangGraph의 특정 노드 실패를 다룰 때는 <code>RetryPolicy</code>, 일반 LangChain 체인 호출을 다시 시도할 때는 <code>with_retry()</code>를 사용한다.</p>
+<hr>
+<h2 id="section-6">5. Checkpointer를 이용한 노드 재개</h2>
+<p>재시도는 같은 실행 안에서 즉시 다시 시도하는 기능이고, 재개는 실패 상태를 저장해 두었다가 나중에 이어서 실행하는 기능이다.</p>
+<pre><code class="language-python">graph = builder.compile(
+    checkpointer=InMemorySaver()
+)
+
+config = {
+    &quot;configurable&quot;: {
+        &quot;thread_id&quot;: &quot;fault-sequential-1&quot;
+    }
+}
+</code></pre>
+<p>첫 실행에서 <code>call_service</code>가 실패했다면 상태를 확인한다.</p>
+<pre><code class="language-python">snapshot = graph.get_state(config)
+
+print(snapshot.values)
+print(snapshot.next)
+</code></pre>
+<pre><code class="language-text">values → prepare가 만든 prepared 값이 저장됨
+next   → (&#39;call_service&#39;,)
+</code></pre>
+<p>같은 <code>thread_id</code>와 <code>None</code>을 넣어 재개한다.</p>
+<pre><code class="language-python">result = graph.invoke(None, config)
+</code></pre>
+<p>새 입력 대신 <code>None</code>을 넣는 이유는 Checkpointer에 기존 State가 저장되어 있기 때문이다.</p>
+<hr>
+<h2 id="section-7">6. Super-step과 병렬 노드 재개</h2>
+<p>Super-step은 함수 이름이 아니라 <strong>같은 실행 차례에 처리되는 노드 묶음</strong>을 설명하는 말이다.</p>
+<pre><code class="language-python">builder.add_edge(START, &quot;prepare&quot;)
+builder.add_edge(&quot;prepare&quot;, &quot;stable_branch&quot;)
+builder.add_edge(&quot;prepare&quot;, &quot;unstable_branch&quot;)
+builder.add_edge(&quot;stable_branch&quot;, &quot;summarize&quot;)
+builder.add_edge(&quot;unstable_branch&quot;, &quot;summarize&quot;)
+builder.add_edge(&quot;summarize&quot;, END)
+</code></pre>
+<pre><code class="language-text">첫 번째 super-step: prepare
+두 번째 super-step: stable_branch + unstable_branch
+세 번째 super-step: summarize
+</code></pre>
+<p>호출 횟수 확인용 딕셔너리는 다음과 같다.</p>
+<pre><code class="language-python">call_count = {
+    &quot;prepare&quot;: 0,
+    &quot;stable&quot;: 0,
+    &quot;unstable&quot;: 0,
+}
+</code></pre>
+<p>각 노드가 실행될 때 자기 값을 1씩 증가시킨다. 첫 실행에서 <code>stable_branch</code>는 성공하고 <code>unstable_branch</code>만 실패하면 Checkpointer는 성공한 결과를 저장한다. 이후 같은 thread를 재개하면 완료된 <code>stable_branch</code>는 다시 실행하지 않고 미완료 상태인 <code>unstable_branch</code>만 실행한다.</p>
+<pre><code class="language-text">첫 실행 후: prepare=1, stable=1, unstable=1
+재개 후:   prepare=1, stable=1, unstable=2
+</code></pre>
+<p><code>unstable=2</code>가 된 이유는 실패한 노드가 한 번 더 실행됐기 때문이다. <code>stable=1</code>이 유지된 이유는 성공 결과가 이미 Checkpoint에 저장됐기 때문이다.</p>
+<hr>
+<h2 id="section-8">7. 노드 실행 시간 제한</h2>
+<pre><code class="language-python">builder.add_node(
+    &quot;slow_service&quot;,
+    slow_service,
+    timeout=TimeoutPolicy(run_timeout=2.0),
+    retry_policy=RetryPolicy(
+        max_attempts=2,
+        retry_on=NodeTimeoutError,
+    ),
+)
+</code></pre>
+<p>노드가 2초 안에 끝나지 않으면 <code>NodeTimeoutError</code>가 발생하고, 해당 오류를 대상으로 최대 두 번 시도한다. 비동기 노드는 <code>await graph.ainvoke(...)</code>로 실행한다.</p>
+<hr>
+<h2 id="section-9">8. 재시도 소진 후 Error Handler</h2>
+<pre><code class="language-python">def service_error_handler(
+    state: RecoveryState,
+    error: NodeError,
+) -&gt; Command:
+    return Command(
+        update={
+            &quot;status&quot;: &quot;failed&quot;,
+            &quot;error_message&quot;: f&quot;{error.node}: {error.error}&quot;,
+        },
+        goto=&quot;finalize&quot;,
+    )
+</code></pre>
+<pre><code class="language-python">builder.add_node(
+    &quot;call_service&quot;,
+    failing_service,
+    retry_policy=RetryPolicy(
+        max_attempts=2,
+        retry_on=ConnectionError,
+    ),
+    error_handler=service_error_handler,
+)
+</code></pre>
+<p>흐름은 다음과 같다.</p>
+<pre><code class="language-text">call_service 실행
+→ ConnectionError
+→ RetryPolicy로 재시도
+→ 최대 횟수까지 계속 실패
+→ service_error_handler 실행
+→ status와 error_message 저장
+→ finalize로 이동
+→ 그래프 정상 종료
+</code></pre>
+<p>그래프가 예외로 그대로 끝나는 대신 실패 상태를 State에 남기고 마무리하도록 만든 것이다.</p>
+<hr>
+<h2 id="section-10">9. 공통 노드 정책 설정</h2>
+<p>여러 노드에 같은 재시도 정책과 오류 처리기를 반복해서 넣어야 한다면 Builder의 기본 정책으로 지정할 수 있다.</p>
+<pre><code class="language-python">builder.set_node_defaults(
+    retry_policy=common_retry_policy,
+    error_handler=common_error_handler,
+)
+</code></pre>
+<p>이 설정은 해당 Builder에 추가되는 노드들의 기본값이다. 프로그램 전체에 적용되는 완전한 전역 설정은 아니다. 특정 노드에서 별도의 정책을 넣으면 그 노드의 설정이 우선한다.</p>
+<hr>
+<h2 id="section-11">10. 멱등성과 중복 저장 방지</h2>
+<p>멱등성은 같은 요청을 여러 번 실행해도 외부 결과가 한 번만 반영되도록 만드는 성질이다.</p>
+<pre><code class="language-python">processed_request_ids = set()
+external_rows = []
+
+def idempotent_save(state):
+    request_id = state[&quot;request_id&quot;]
+
+    if request_id not in processed_request_ids:
+        external_rows.append({
+            &quot;request_id&quot;: request_id,
+            &quot;content&quot;: state[&quot;content&quot;],
+        })
+        processed_request_ids.add(request_id)
+
+    if not save_gate[&quot;allow_completion&quot;]:
+        raise ConnectionError(
+            &quot;저장 후 응답을 받지 못했습니다.&quot;
+        )
+
+    return {&quot;saved&quot;: True}
+</code></pre>
+<p>첫 실행에서 외부 저장은 성공했지만 응답을 받지 못할 수 있다. 다시 실행할 때 같은 <code>request_id</code>가 Set에 있으므로 <code>external_rows.append(...)</code>를 건너뛴다. 따라서 같은 데이터가 두 번 저장되지 않는다.</p>
+<hr>
+<h1>Agent Tool Control</h1>
+<h2 id="section-12">11. Agent Tool 통제가 필요한 이유</h2>
+<p>LLM은 사용자의 자연어를 읽고 Tool 이름과 인자를 제안한다. 하지만 LLM이 제안했다고 바로 실행하면 안 된다.</p>
+<pre><code class="language-text">사용자 자연어
+→ LLM이 Tool 이름과 인자 생성
+→ 입력 형식 검사
+→ 권한·한도·승인 검사
+→ 실제 Tool 실행
+→ Tool 결과 형식 검사
+→ LLM이 최종 답변 생성
+</code></pre>
+<p>Middleware는 Tool 호출 앞뒤에서 공통 검사를 자동으로 실행하도록 연결하는 장치다.</p>
+<hr>
+<h2 id="section-13">12. Tool 입력 Schema</h2>
+<pre><code class="language-python">class LookupAccountArgs(BaseModel):
+    account_id: str = Field(
+        min_length=3,
+        max_length=40,
+    )
+
+
+class TransferArgs(BaseModel):
+    account_id: str = Field(
+        min_length=3,
+        max_length=40,
+    )
+    amount: int = Field(gt=0, le=1000000)
+    request_id: str = Field(
+        min_length=8,
+        max_length=80,
+    )
+</code></pre>
+<p>이 클래스들은 Structured Output이 아니라 <strong>Tool이 받을 입력 형식</strong>이다.</p>
+<pre><code class="language-python">@tool(
+    &quot;lookup_account&quot;,
+    args_schema=LookupAccountArgs,
+)
+def lookup_account_tool(account_id: str):
+    return account_responses[account_id].copy()
+</code></pre>
+<p><code>args_schema</code>를 Tool에 연결하면 LLM에게 필요한 인자 구조를 알려주고, 실제 호출 시에도 형식을 검사할 수 있다.</p>
+<hr>
+<h2 id="section-14">13. Tool 이름과 Schema 매핑</h2>
+<pre><code class="language-python">TOOL_SCHEMAS = {
+    &quot;lookup_account&quot;: LookupAccountArgs,
+    &quot;transfer&quot;: TransferArgs,
+}
+</code></pre>
+<p><code>proposal[&quot;name&quot;]</code>에는 LLM이 호출하려는 Tool 이름이 들어 있다.</p>
+<pre><code class="language-python">schema = TOOL_SCHEMAS.get(
+    proposal[&quot;name&quot;]
+)
+</code></pre>
+<p><code>lookup_account</code>면 <code>LookupAccountArgs</code>, <code>transfer</code>면 <code>TransferArgs</code>를 가져온다. 등록되지 않은 이름이면 허용되지 않은 Tool로 처리한다.</p>
+<hr>
+<h2 id="section-15">14. model_validate로 인자 검사</h2>
+<pre><code class="language-python">try:
+    args = schema.model_validate(
+        proposal[&quot;args&quot;]
+    )
+except ValidationError:
+    return failure(
+        &quot;INVALID_ARGUMENT&quot;,
+        &quot;Tool 인자가 올바르지 않습니다.&quot;,
+    )
+</code></pre>
+<p><code>model_validate()</code>는 딕셔너리가 Pydantic Schema 조건에 맞는지 검사한다.</p>
+<pre><code class="language-text">입력: {&quot;account_id&quot;: &quot;acct-001&quot;}
+→ LookupAccountArgs 조건 통과
+→ args.account_id로 사용 가능
+
+입력: {&quot;account_id&quot;: &quot;x&quot;}
+→ 최소 길이 3 미만
+→ ValidationError
+</code></pre>
+<hr>
+<h2 id="section-16">15. 권한, 송금 한도, 승인 검사</h2>
+<pre><code class="language-python">def validate_proposal(proposal, context):
+    if context[&quot;cancelled&quot;]:
+        return {&quot;status&quot;: &quot;cancelled&quot;, ...}
+
+    schema = TOOL_SCHEMAS.get(proposal[&quot;name&quot;])
+    if schema is None:
+        return failure(&quot;UNKNOWN_TOOL&quot;, ...)
+
+    try:
+        args = schema.model_validate(proposal[&quot;args&quot;])
+    except ValidationError:
+        return failure(&quot;INVALID_ARGUMENT&quot;, ...)
+
+    if args.account_id not in context[&quot;allowed_accounts&quot;]:
+        return failure(&quot;FORBIDDEN&quot;, ...)
+
+    if proposal[&quot;name&quot;] == &quot;transfer&quot;:
+        if args.amount &gt; MAX_TRANSFER:
+            return failure(&quot;LIMIT_EXCEEDED&quot;, ...)
+
+        if args.request_id in context[&quot;rejected_request_ids&quot;]:
+            return {&quot;status&quot;: &quot;cancelled&quot;, ...}
+
+        if args.request_id not in context[&quot;approved_request_ids&quot;]:
+            return {&quot;status&quot;: &quot;waiting_for_human&quot;, ...}
+
+    return args
+</code></pre>
+<p>검사에 실패하거나 승인을 기다려야 하면 사유가 담긴 <code>dict</code>를 반환한다. 모든 검사를 통과하면 Pydantic 인자 객체를 반환한다.</p>
+<hr>
+<h2 id="section-17">16. 실행 Context</h2>
+<pre><code class="language-python">execution_context = {
+    &quot;user_id&quot;: &quot;user-1&quot;,
+    &quot;allowed_accounts&quot;: {&quot;acct-001&quot;},
+    &quot;approved_request_ids&quot;: set(),
+    &quot;rejected_request_ids&quot;: set(),
+    &quot;cancelled&quot;: False,
+}
+</code></pre>
+<p>Agent 실행 시 전달한다.</p>
+<pre><code class="language-python">agent.invoke(
+    {&quot;messages&quot;: [...]},
+    context=execution_context,
+)
+</code></pre>
+<p>Middleware에서는 다음 코드로 읽는다.</p>
+<pre><code class="language-python">request.runtime.context
+</code></pre>
+<p>Context는 그래프의 State와 달리 현재 실행의 사용자 권한, 승인 목록, 설정 같은 실행 환경 정보를 전달한다.</p>
+<hr>
+<h2 id="section-18">17. 실행 전 Middleware</h2>
+<pre><code class="language-python">@wrap_tool_call
+def validate_tool_call(
+    request: ToolCallRequest,
+    handler,
+):
+    result = validate_proposal(
+        request.tool_call,
+        request.runtime.context,
+    )
+
+    if isinstance(result, dict):
+        return ToolMessage(
+            content=json.dumps(
+                result,
+                ensure_ascii=False,
+            ),
+            tool_call_id=request.tool_call[&quot;id&quot;],
+            name=request.tool_call[&quot;name&quot;],
+            status=&quot;error&quot;,
+        )
+
+    return handler(request)
+</code></pre>
+<p><code>isinstance(result, dict)</code>는 단순히 값이 존재하는지 확인하는 코드가 아니다. 이 예제에서는 <code>dict</code>를 <strong>실패·취소·승인 대기 결과</strong>로 사용하기 때문에 실행을 막는 조건이다.</p>
+<p><code>handler(request)</code>는 다음 Middleware 또는 실제 Tool 실행으로 넘기는 함수다. 검사를 통과했을 때만 호출한다.</p>
+<hr>
+<h2 id="section-19">18. 실행 후 결과 검증 Middleware</h2>
+<pre><code class="language-python">class LookupResponse(BaseModel):
+    account_id: str
+    balance: int
+    currency: Literal[&quot;KRW&quot;]
+</code></pre>
+<pre><code class="language-python">@wrap_tool_call
+def validate_tool_result(request, handler):
+    message = handler(request)
+
+    if (
+        request.tool_call[&quot;name&quot;] != &quot;lookup_account&quot;
+        or message.status == &quot;error&quot;
+    ):
+        return message
+
+    try:
+        response = LookupResponse.model_validate_json(
+            message.content
+        )
+    except ValidationError:
+        return make_result_error(...)
+
+    if response.account_id != request.tool_call[&quot;args&quot;][&quot;account_id&quot;]:
+        return make_result_error(...)
+
+    return message
+</code></pre>
+<p>실행 전 검사와 달리 먼저 <code>handler(request)</code>를 호출한다. 즉 Tool을 실행해 결과 메시지를 받은 다음, 결과의 필드·형식과 요청 계좌 일치 여부를 검사한다.</p>
+<pre><code class="language-text">실행 전 Middleware
+→ 실행 후 Middleware 진입
+→ 실제 Tool 실행
+→ 실행 후 Middleware가 결과 검사
+→ 실행 전 Middleware로 결과 반환
+</code></pre>
+<hr>
+<h2 id="section-20">19. create_agent와 Middleware 등록</h2>
+<pre><code class="language-python">agent = create_agent(
+    model=llm,
+    tools=tools,
+    system_prompt=system_prompt,
+    middleware=[
+        force_tool_call,
+        validate_tool_call,
+        validate_tool_result,
+    ],
+)
+</code></pre>
+<p>함수에 <code>@wrap_tool_call</code>을 붙였다고 자동으로 모든 Agent에 적용되는 것은 아니다. <code>create_agent(..., middleware=[...])</code> 목록에 넣어야 해당 Agent의 호출 흐름에 연결된다.</p>
+<p>직접 <code>StateGraph</code>로 Agent를 만들었다면 같은 검사를 별도 Node로 구성할 수 있다. <code>create_agent</code>는 일반적인 Tool 호출 Agent를 빠르게 만들 때 편리하다.</p>
+<hr>
+<h2 id="section-21">20. Tool 호출 횟수 제한</h2>
+<pre><code class="language-python">limited_agent = create_agent(
+    model=llm,
+    tools=tools,
+    middleware=[
+        ToolCallLimitMiddleware(
+            run_limit=0,
+            exit_behavior=&quot;continue&quot;,
+        ),
+        force_tool_call,
+        validate_tool_call,
+        validate_tool_result,
+    ],
+)
+</code></pre>
+<p><code>run_limit=0</code>이면 한 번의 Agent 실행에서 Tool 호출을 허용하지 않는다. 특정 Tool만 제한할 수도 있다.</p>
+<pre><code class="language-python">ToolCallLimitMiddleware(
+    tool_name=&quot;lookup_account&quot;,
+    run_limit=2,
+)
+</code></pre>
+<hr>
+<h2 id="section-22">21. Tool이 많아질 때 검사 함수 분리</h2>
+<pre><code class="language-python">TOOL_GUARDS = {
+    &quot;lookup_account&quot;: validate_lookup,
+    &quot;transfer&quot;: validate_transfer,
+}
+</code></pre>
+<pre><code class="language-python">@wrap_tool_call
+def validate_by_tool(request, handler):
+    tool_call = request.tool_call
+    guard = TOOL_GUARDS.get(tool_call[&quot;name&quot;])
+
+    if guard is None:
+        result = failure(&quot;UNKNOWN_TOOL&quot;, ...)
+    else:
+        result = guard(
+            tool_call[&quot;args&quot;],
+            request.runtime.context,
+        )
+
+    if isinstance(result, dict):
+        return ToolMessage(...)
+
+    return handler(request)
+</code></pre>
+<p>Tool이 적을 때는 하나의 <code>validate_proposal()</code>에서 이름으로 나눌 수 있다. Tool이 많아지면 Tool별 검사 함수를 만들고 매핑표에서 선택하면 코드가 읽기 쉬워진다.</p>
+<hr>
+<h2 id="section-23">22. Context로 Tool 실행 허용하기 실습</h2>
+<pre><code class="language-python">@tool
+def get_notice() -&gt; str:
+    &quot;&quot;&quot;안내 문구를 조회한다.&quot;&quot;&quot;
+    print(&quot;Tool 실행&quot;)
+    return &quot;오늘 수업은 오후 6시에 시작합니다.&quot;
+</code></pre>
+<pre><code class="language-python">@wrap_tool_call
+def validate_tool_call(request, handler):
+    result = request.runtime.context[&quot;allow_tool&quot;]
+
+    if not result:
+        return ToolMessage(
+            content=json.dumps(
+                {
+                    &quot;message&quot;:
+                    &quot;Tool 실행이 허용되지 않았습니다.&quot;
+                },
+                ensure_ascii=False,
+            ),
+            tool_call_id=request.tool_call[&quot;id&quot;],
+            name=request.tool_call[&quot;name&quot;],
+            status=&quot;error&quot;,
+        )
+
+    return handler(request)
+</code></pre>
+<pre><code class="language-text">allow_tool=True
+→ 검사를 통과
+→ handler(request)
+→ get_notice 실행
+
+allow_tool=False
+→ ToolMessage(error) 반환
+→ get_notice는 실행되지 않음
+</code></pre>
+<p>계좌 예제에서는 복잡한 <code>validate_proposal()</code>을 호출했고, 마지막 실습에서는 Boolean 하나만 확인하도록 단순화한 것이다.</p>
+<hr>
+<h1>LangGraph Logging</h1>
+<h2 id="section-24">23. print 대신 logging을 사용하는 이유</h2>
+<p><code>print()</code>는 값을 잠깐 확인하기에는 편하지만 실제 서비스 기록에는 부족하다. <code>logging</code>은 시간, 중요도, 로거 이름을 함께 남기고 화면과 파일에 서로 다른 기준으로 출력할 수 있다.</p>
+<pre><code class="language-text">print
+→ 단순 출력
+
+logging
+→ 시간 + 레벨 + 모듈 이름 + 메시지
+→ 화면과 파일 동시 기록
+→ 파일 크기별 교체
+→ traceback 기록
+</code></pre>
+<hr>
+<h2 id="section-25">24. Logger, Handler, Formatter</h2>
+<table>
+<thead>
+<tr>
+<th>구성 요소</th>
+<th>역할</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Logger</td>
+<td>로그를 생성하고 전체 최소 레벨을 결정</td>
+</tr>
+<tr>
+<td>Handler</td>
+<td>로그를 화면이나 파일 등 원하는 위치로 전달</td>
+</tr>
+<tr>
+<td>Formatter</td>
+<td>로그 한 줄의 출력 형식을 결정</td>
+</tr>
+</tbody></table>
+<pre><code class="language-python">logger = logging.getLogger(&quot;lesson.langgraph&quot;)
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+console_handler = logging.StreamHandler(
+    sys.stdout
+)
+
+formatter = logging.Formatter(
+    &quot;%(asctime)s | %(levelname)s | &quot;
+    &quot;%(name)s | %(message)s&quot;,
+    datefmt=&quot;%H:%M:%S&quot;,
+)
+
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+</code></pre>
+<p><code>propagate=False</code>는 상위 로거로 다시 전달되어 로그가 중복 출력되는 것을 막는다.</p>
+<p>Notebook 셀을 반복 실행하면 Handler가 중복 등록될 수 있어 기존 Handler를 제거한다.</p>
+<pre><code class="language-python">for handler in logger.handlers[:]:
+    logger.removeHandler(handler)
+    handler.close()
+</code></pre>
+<hr>
+<h2 id="section-26">25. 로그 레벨</h2>
+<pre><code class="language-text">DEBUG &lt; INFO &lt; WARNING &lt; ERROR &lt; CRITICAL
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>레벨</th>
+<th>사용 예</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>DEBUG</code></td>
+<td>변수, 중간 결과 등 상세 디버깅 정보</td>
+</tr>
+<tr>
+<td><code>INFO</code></td>
+<td>노드 시작·완료 등 정상 실행 정보</td>
+</tr>
+<tr>
+<td><code>WARNING</code></td>
+<td>실행은 가능하지만 확인이 필요한 상황</td>
+</tr>
+<tr>
+<td><code>ERROR</code></td>
+<td>특정 작업 실패</td>
+</tr>
+<tr>
+<td><code>CRITICAL</code></td>
+<td>서비스 전체에 큰 영향을 주는 심각한 오류</td>
+</tr>
+</tbody></table>
+<p><code>logger.setLevel(logging.WARNING)</code>이면 WARNING 이상만 통과하므로 DEBUG와 INFO는 출력되지 않는다.</p>
+<hr>
+<h2 id="section-27">26. 변수와 함께 로그 남기기</h2>
+<pre><code class="language-python">logger.info(
+    f&quot;node={node_name} &quot;
+    f&quot;documents={document_count} &quot;
+    f&quot;elapsed_ms={elapsed_ms:.2f}&quot;
+)
+</code></pre>
+<p>문장만 기록하는 것보다 <code>key=value</code> 형태로 남기면 어떤 노드에서 몇 개의 문서를 처리했고 얼마나 걸렸는지 검색하고 비교하기 쉽다.</p>
+<hr>
+<h2 id="section-28">27. 화면과 파일에 서로 다른 레벨 기록</h2>
+<pre><code class="language-python">file_handler = logging.FileHandler(
+    log_path,
+    mode=&quot;a&quot;,
+    encoding=&quot;utf-8&quot;,
+)
+
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+logger.setLevel(logging.DEBUG)
+console_handler.setLevel(logging.INFO)
+file_handler.setLevel(logging.DEBUG)
+</code></pre>
+<p>로그는 Logger의 기준을 먼저 통과한 뒤 각 Handler의 기준도 통과해야 한다.</p>
+<pre><code class="language-text">DEBUG 로그
+→ Logger DEBUG 통과
+→ Console INFO에서 차단
+→ File DEBUG 통과
+→ 파일에만 저장
+</code></pre>
+<hr>
+<h2 id="section-29">28. 로그 파일 로테이션</h2>
+<pre><code class="language-python">file_handler = RotatingFileHandler(
+    log_path,
+    maxBytes=1024,
+    backupCount=2,
+    encoding=&quot;utf-8&quot;,
+)
+</code></pre>
+<p>로그 파일이 계속 커지지 않도록 최대 크기에 도달하면 새 파일로 교체한다.</p>
+<pre><code class="language-text">29-langgraph.log    → 현재 로그
+29-langgraph.log.1  → 가장 최근 백업
+29-langgraph.log.2  → 그 이전 백업
+</code></pre>
+<hr>
+<h2 id="section-30">29. logger.error와 logger.exception 차이</h2>
+<pre><code class="language-python">try:
+    value = 10 / 0
+except ZeroDivisionError:
+    logger.error(&quot;계산 실패&quot;)
+</code></pre>
+<p><code>logger.error()</code>는 오류 메시지만 기록한다.</p>
+<pre><code class="language-python">try:
+    value = 10 / 0
+except ZeroDivisionError:
+    logger.exception(&quot;계산 실패&quot;)
+    raise
+</code></pre>
+<p><code>logger.exception()</code>은 <code>except</code> 안에서 사용하면 오류 메시지와 traceback을 함께 기록한다. <code>logging</code>은 오류를 해결하거나 재시도하지 않으므로, 그래프에도 실패를 전달하려면 다시 <code>raise</code>해야 한다.</p>
+<hr>
+<h2 id="section-31">30. LangGraph Node에 로그 적용하기</h2>
+<pre><code class="language-python">def prepare(state: LoggingState):
+    logger.info(&quot;prepare 시작&quot;)
+    question = state[&quot;question&quot;].strip()
+    logger.info(&quot;prepare 완료&quot;)
+    return {&quot;question&quot;: question}
+</code></pre>
+<pre><code class="language-python">def answer(state: LoggingState):
+    logger.info(&quot;answer 시작&quot;)
+
+    try:
+        if not state[&quot;question&quot;]:
+            raise ValueError(&quot;질문이 비어 있습니다.&quot;)
+
+        response = (
+            f&quot;질문을 받았습니다: {state[&#39;question&#39;]}&quot;
+        )
+    except ValueError:
+        logger.exception(&quot;answer 실패&quot;)
+        raise
+
+    logger.info(&quot;answer 완료&quot;)
+    return {&quot;answer&quot;: response}
+</code></pre>
+<p>정상 실행 로그는 다음 순서로 나온다.</p>
+<pre><code class="language-text">prepare 시작
+prepare 완료
+answer 시작
+answer 완료
+</code></pre>
+<p>질문이 비어 있으면 <code>answer 시작</code> 다음에 <code>answer 실패</code>와 traceback이 기록되고 <code>answer 완료</code>는 출력되지 않는다.</p>
+<hr>
+<h2 id="section-32">31. 세 파일의 전체 연결</h2>
+<pre><code class="language-text">사용자 요청
+→ Agent가 Tool 호출 제안
+→ 실행 전 Middleware가 인자·권한·승인 검사
+→ Tool 또는 LangGraph Node 실행
+→ 일시적 오류면 RetryPolicy로 재시도
+→ 중단되면 Checkpointer에서 재개
+→ 재시도 소진 시 Error Handler가 실패 State 기록
+→ 실행 후 Middleware가 Tool 결과 검사
+→ Logger가 시작·완료·오류·traceback 기록
+→ 최종 응답
+</code></pre>
+<hr>
+<h2 id="section-33">32. 외워야 할 코드</h2>
+<p>전체 코드를 통째로 외우기보다 다음 형태를 기억하면 된다.</p>
+<h3>1. Node 재시도</h3>
+<pre><code class="language-python">builder.add_node(
+    &quot;node_name&quot;,
+    node_function,
+    retry_policy=RetryPolicy(
+        max_attempts=3,
+        retry_on=ConnectionError,
+    ),
+)
+</code></pre>
+<h3>2. Checkpoint 재개</h3>
+<pre><code class="language-python">config = {
+    &quot;configurable&quot;: {
+        &quot;thread_id&quot;: &quot;thread-1&quot;
+    }
+}
+
+graph.invoke(input_state, config)
+graph.invoke(None, config)
+</code></pre>
+<h3>3. 최종 실패 처리</h3>
+<pre><code class="language-python">def error_handler(state, error):
+    return Command(
+        update={&quot;status&quot;: &quot;failed&quot;},
+        goto=&quot;finalize&quot;,
+    )
+</code></pre>
+<h3>4. 실행 전 Tool 검사</h3>
+<pre><code class="language-python">@wrap_tool_call
+def validate_tool_call(request, handler):
+    result = validate(...)
+
+    if failed(result):
+        return ToolMessage(status=&quot;error&quot;, ...)
+
+    return handler(request)
+</code></pre>
+<h3>5. 실행 후 Tool 검사</h3>
+<pre><code class="language-python">@wrap_tool_call
+def validate_tool_result(request, handler):
+    message = handler(request)
+    validate_result(message)
+    return message
+</code></pre>
+<h3>6. Node 로그</h3>
+<pre><code class="language-python">def node(state):
+    logger.info(&quot;node 시작&quot;)
+    try:
+        result = work(state)
+    except Exception:
+        logger.exception(&quot;node 실패&quot;)
+        raise
+    logger.info(&quot;node 완료&quot;)
+    return result
+</code></pre>
+<hr>
+<h2 id="section-34">33. 이번 학습에서 기억할 점</h2>
+<ul>
+<li><code>RetryPolicy</code>는 실패한 LangGraph Node를 자동으로 다시 실행한다.</li>
+<li><code>max_attempts</code>는 최초 실행을 포함한 최대 시도 횟수다.</li>
+<li>반환값이 <code>{&quot;status&quot;: &quot;failed&quot;}</code>인 것은 예외가 아니므로 자동 재시도되지 않는다.</li>
+<li>재개하려면 Checkpointer와 같은 <code>thread_id</code>가 필요하다.</li>
+<li><code>invoke(None, config)</code>는 저장된 State를 사용해 미완료 노드부터 이어서 실행한다.</li>
+<li>병렬 실행에서는 완료된 노드 결과를 저장하고 실패한 노드만 재개한다.</li>
+<li>Super-step은 함수가 아니라 같은 차례에 실행되는 노드 묶음이다.</li>
+<li>Error Handler는 재시도를 모두 소진한 뒤 실패 상태를 기록하고 다음 노드로 보낼 수 있다.</li>
+<li>공통 노드 정책은 해당 Builder의 기본값이며 프로그램 전체 전역 설정은 아니다.</li>
+<li>멱등성은 같은 <code>request_id</code>의 외부 작업이 중복 반영되지 않게 한다.</li>
+<li>Tool Schema는 Tool이 받을 입력 형식이다.</li>
+<li><code>model_validate()</code>는 딕셔너리가 Pydantic Schema에 맞는지 검사한다.</li>
+<li><code>request.runtime.context</code>에는 현재 실행의 권한·승인·허용 여부 같은 환경 정보가 들어 있다.</li>
+<li>실행 전 Middleware는 <code>handler()</code> 전에 검사하고, 실행 후 Middleware는 <code>handler()</code> 결과를 검사한다.</li>
+<li><code>handler(request)</code>를 호출해야 다음 Middleware 또는 실제 Tool이 실행된다.</li>
+<li>Middleware는 <code>create_agent(..., middleware=[...])</code>에 등록해야 적용된다.</li>
+<li>Logger는 로그를 만들고, Handler는 출력 위치를 정하고, Formatter는 출력 모양을 정한다.</li>
+<li><code>logger.exception()</code>은 오류 메시지와 traceback을 함께 기록한다.</li>
+<li>Logging은 오류를 처리하지 않으므로 필요한 경우 <code>raise</code>로 다시 전달한다.</li>
+</ul>
+<hr>
+<h2 id="section-35">34. 헷갈린 점</h2>
+<p>처음에는 병렬 그래프를 재개할 때 왜 <code>unstable_branch</code>만 다시 실행되는지 이해하기 어려웠다. Edge가 자동으로 실패 노드만 판단하는 것이 아니라, Checkpointer가 성공한 <code>stable_branch</code>의 결과와 실패한 Task 상태를 저장하기 때문에 LangGraph가 미완료 Task만 이어서 실행하는 것이다.</p>
+<p><code>if isinstance(result, dict)</code>도 딕셔너리 안에 값이 있으면 실행한다는 뜻으로 보였다. 하지만 계좌 예제에서는 검증 실패 결과를 일부러 딕셔너리로 반환하도록 약속했기 때문에, 딕셔너리면 Tool을 실행하지 않고 오류 <code>ToolMessage</code>를 반환하는 코드였다.</p>
+<p>Tool 입력 Schema와 Structured Output도 비슷해 보였다. <code>LookupAccountArgs</code>와 <code>TransferArgs</code>는 Tool에 들어갈 입력 형식이고, <code>LookupResponse</code>는 Tool이 실행된 뒤 반환해야 할 결과 형식이다.</p>
+<p>Middleware의 <code>handler</code>는 직접 만든 함수가 아니라 LangChain이 제공하는 다음 실행 함수다. 실행 전 검사를 통과하면 <code>handler(request)</code>를 호출해 실제 Tool로 보내고, 실행 후 검증에서는 먼저 <code>handler(request)</code>로 Tool을 실행한 뒤 결과를 검사한다.</p>
+<p>Logging도 Error Handler처럼 오류를 해결하는 기능으로 보일 수 있지만 역할이 다르다. Logging은 실행 상황을 기록하고, RetryPolicy나 Error Handler가 실제 재시도와 실패 흐름을 처리한다.</p>
+<hr>
+<h2 id="section-36">추가!</h2>
+<p>오늘 배운 것 정리</p>
+<p>Fault Tolerance</p>
+<ul>
+<li>일시적인 오류는 <code>RetryPolicy</code>로 같은 노드를 다시 실행한다.</li>
+<li>나중에 이어서 실행하려면 Checkpointer와 <code>thread_id</code>를 사용한다.</li>
+<li>병렬 실행에서는 성공 결과는 유지하고 실패한 Task만 재개한다.</li>
+<li>재시도까지 모두 실패하면 Error Handler로 실패 상태를 남기고 마무리한다.</li>
+<li>외부 저장 작업에는 <code>request_id</code>를 이용한 멱등성이 필요하다.</li>
+</ul>
+<p>Agent Tool Control</p>
+<ul>
+<li>LLM이 만든 Tool 이름과 인자를 그대로 신뢰하지 않는다.</li>
+<li>Pydantic Schema로 입력 형식을 확인한다.</li>
+<li>Context로 사용자 권한, 승인, 취소, Tool 허용 여부를 확인한다.</li>
+<li>실행 전 Middleware에서 막을 수 있고 실행 후 Middleware에서 반환 결과도 검사할 수 있다.</li>
+<li>일반적인 Tool Agent는 <code>create_agent</code>와 Middleware로 빠르게 만들고, 복잡한 흐름은 <code>StateGraph</code>의 Node로 직접 구성할 수 있다.</li>
+</ul>
+<p>LangGraph Logging</p>
+<ul>
+<li>Node의 시작, 완료, 주요 변수, 오류를 로그로 남긴다.</li>
+<li>화면에는 INFO 이상, 파일에는 DEBUG 이상처럼 출력 기준을 나눌 수 있다.</li>
+<li><code>RotatingFileHandler</code>로 로그 파일 크기를 관리한다.</li>
+<li>오류가 발생하면 <code>logger.exception()</code>으로 traceback을 남기고 <code>raise</code>로 그래프에 실패를 전달한다.</li>
+</ul>
+<p>코드를 외우기보다 다음 흐름을 먼저 확인하면 된다.</p>
+<pre><code class="language-text">입력
+→ 어떤 검사와 Node가 실행되는가
+→ 실패하면 누가 재시도하는가
+→ State 또는 Context에 무엇이 들어 있는가
+→ 어떤 Middleware가 Tool을 막거나 통과시키는가
+→ 최종 결과와 오류가 어디에 기록되는가
+</code></pre>
+

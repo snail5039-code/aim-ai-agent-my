@@ -1,0 +1,16 @@
+# Dependencies used by Python scripts and Jupyter notebooks in this repository.
+-r langchain_/10-rag-evalution-script/requirements.txt
+# Ragas 0.4.3 imports VertexAI from this version.
+langchain-community==0.4.1
+langchain
+langchain-openai
+langgraph
+langsmith
+requests
+httpx
+pydantic
+rich
+cowsay
+ipython
+ipykernel
+jupyterlab

@@ -1,0 +1,4 @@
+
+CREATE DATABASE world;
+
+CREATE DATABASE dvdrental;

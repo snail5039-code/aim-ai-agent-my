@@ -1,3 +1,4 @@
+-- Active: 1790907918492@@127.0.0.1@5432@dvdrental@public
 
 -- VSCode 확장의 연결 DB를 dvdrental로 변경한 뒤,
 -- ctrl + a로 전체 선택 후 우측 상단의 버튼으로 실행한다.

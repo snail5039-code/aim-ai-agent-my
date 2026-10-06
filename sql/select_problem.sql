@@ -139,7 +139,7 @@ LIMIT 1;
  SELECT countrycode, district, count(*), sum(population) 
  FROM city
  GROUP BY countrycode, district
- HAVING avg(population) >= 1000000 OR count(*) >= 3;
+ HAVING avg(population) >= 1000000 AND count(*) >= 3;
 
 SELECT * FROM country;
 -- 아시아 대륙의 국가들 중에서, Region별 평균 GNP가 1000 이상인 Region, 평균 GNP를 조회하시오.
@@ -168,3 +168,101 @@ FROM city
 WHERE population >= 500000
 GROUP BY countrycode
 HAVING avg(population) >= 1000000;
+
+
+-- 실습
+-- 모든 문제는 dvdrental 데이터베이스의 film 테이블을 사용한다.
+-- 상단의 연결 database가 dvdrental로 연결되어있는지 확인한다.
+ 
+
+-- title: 영화 제목
+-- rental_rate: 영화 대여료 (금액)
+-- rating: 영화 관람 등급 (G, PG, R 등)
+-- length: 영화 상영 시간 (분 단위)
+-- rental_duration: 대여 가능 기간 (일 단위)
+-- replacement_cost: 영화 분실 시 변상 비용
+ 
+
+-- 모든 영화의 제목과 대여료를 조회하시오.
+SELECT title, rental_rate 
+FROM film;
+
+-- 대여료가 4달러 이상인 영화의 제목과 대여료를 조회하시오.
+SELECT title, rental_rate 
+FROM film
+WHERE rental_rate >= 4;
+
+-- 제목에 대소문자를 구분하지 않고 'angel'이 포함된 영화의 제목을 조회하시오.
+SELECT title 
+FROM film
+WHERE title ILIKE '%angel%';
+
+-- 대여 기간이 5일 이상이고 대여료가 4달러 이상인 영화의 제목, 대여 기간, 대여료를 조회하시오.
+SELECT title, rental_duration, rental_rate
+FROM film
+WHERE rental_duration >= 5 AND rental_rate >= 4;
+
+-- 등급이 'PG' 또는 'G'이면서 대여 기간이 4일 이하인 영화의 제목, 등급, 대여 기간을 조회하시오.
+SELECT title, rating, rental_duration
+FROM film
+WHERE rating = 'PG' OR rating = 'G' AND rental_duration <= 4;
+
+-- 상영 시간이 60분 이상 120분 이하인 영화의 제목과 상영 시간을 상영 시간 오름차순으로 조회하시오.
+SELECT title, "length" 
+FROM film
+WHERE "length" >= 60 AND "length" <= 120
+ORDER BY "length" ASC;
+
+-- 등급이 'R'인 영화를 제목 오름차순으로 정렬한 뒤, 처음 10개의 제목과 등급을 조회하시오.
+SELECT title, rating 
+FROM film
+WHERE rating = 'R'
+ORDER BY title
+LIMIT 10;
+
+-- 영화의 상영 시간을 중복 없이 긴 순서로 10개 조회하시오.
+SELECT DISTINCT title, "length"
+FROM film
+ORDER BY "length" DESC
+LIMIT 10;
+
+
+-- 상영 시간이 긴 순서로 10번째부터 15번째까지 영화의 제목과 상영 시간을 조회하시오. (상영 시간이 같으면 제목 오름차순)
+SELECT title, "length" 
+FROM film
+ORDER BY "length" DESC, title
+LIMIT 6 OFFSET 9;
+
+-- 등급별 영화 수를 조회하시오.
+SELECT title, rating, count(*)
+FROM film
+GROUP BY title, rating;
+
+-- 대여 기간별 영화 수를 대여 기간 내림차순으로 정렬하여 조회하시오.
+SELECT rental_duration, count(*)  
+FROM film
+GROUP BY rental_duration
+ORDER BY rental_duration;
+
+-- 등급별 영화 수와 평균 상영 시간을 조회하시오.
+SELECT rating, count(*), avg("length") 
+FROM film
+GROUP BY rating;
+
+-- 변상 비용별 영화 수와 평균 대여료를 변상 비용 오름차순으로 정렬하여 조회하시오.
+SELECT replacement_cost, count(*), avg(rental_rate)
+FROM film
+GROUP BY replacement_cost
+ORDER BY replacement_cost;
+
+-- 대여료별 영화 수를 영화 수 내림차순으로 정렬하여 조회하시오.
+SELECT rental_rate , count(*)
+FROM film
+GROUP BY rental_rate
+ORDER BY count(*) DESC;
+
+-- 등급별 평균 대여료가 3달러 미만인 등급과 평균 대여료를 조회하시오.
+SELECT rating, avg(rental_rate)
+FROM film
+GROUP BY rating
+HAVING avg(rental_rate) < 3;

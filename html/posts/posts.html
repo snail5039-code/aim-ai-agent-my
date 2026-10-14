@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>게시글 목록</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="posts.css">
+  </head>
+  <body>
+    <main>
+      <h1 id="page-title">게시글 목록</h1>
+      <p>JSONPlaceholder API에서 게시글을 불러옵니다.</p>
+      <div class="actions">
+        <button id="title-button" type="button" onclick="changeTitle()">첫 글 제목 변경</button>
+        <button id="load-button" type="button" onclick="loadPosts()">게시글 불러오기</button>
+      </div>
+      <p id="message" role="status">게시글 2개를 표시했습니다.</p>
+      <ul id="post-list">
+        <li id="post-1" class="post">
+          <a class="title featured" href="#post-1">HTML 기초</a>
+          <div class="details">
+            <p class="body">HTML은 웹 페이지의 내용과 구조를 나타낸다.</p>
+          </div>
+        </li>
+        <li id="post-2" class="post">
+          <a class="title" href="#post-2">CSS 선택자</a>
+          <div class="details">
+            <p class="body">CSS 선택자로 스타일을 적용할 요소를 찾는다.</p>
+          </div>
+        </li>
+      </ul>
+    </main>
+    <script src="posts.js"></script>
+  </body>
+</html>
